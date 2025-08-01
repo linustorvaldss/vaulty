@@ -9,6 +9,8 @@ import (
 	"gorm.io/gorm"
 )
 
+// db.AutoMigrate(&user.User{}, &project.Project{})
+
 func loadEnv() {
 	if err := godotenv.Load(); err != nil {
 		fmt.Println("Error loading .env file")
@@ -17,6 +19,13 @@ func loadEnv() {
 }
 
 func InitDB() (*gorm.DB, error) {
+
+// 	db.AutoMigrate(
+//     &user.User{},
+//     &project.Project{},
+//     &secret.Secret{},
+// )
+
 	
 	loadEnv()
 
