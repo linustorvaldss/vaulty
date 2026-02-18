@@ -11,12 +11,13 @@ import (
 	"net/http"
 	"os"
 
-	// "log"
-
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
-	// "github.com/linustorvaldss/vaulty/config"
+
+	httpapi "github.com/linustorvaldss/vaulty/internal/adapter/http"
+	"github.com/linustorvaldss/vaulty/internal/adapter/memory"
+	"github.com/linustorvaldss/vaulty/internal/service"
 )
 
 // Config holds environment configuration
@@ -37,6 +38,10 @@ func loadEnvs() Config {
 		Env:  os.Getenv("ENV"),
 	}
 
+	if config.Port == "" {
+		config.Port = "8080"
+	}
+
 	fmt.Print("Port:", config.Port, "\n")
 	fmt.Print("Environment:", config.Env, "\n")
 
@@ -49,14 +54,19 @@ func setupMiddleware(router *gin.Engine) {
 }
 
 func setupRoutes(router *gin.Engine) {
+	store := memory.NewStore()
+	appService := service.NewService(store, store, store)
+	handlers := httpapi.NewHandlers(appService)
 
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"message": "Hello World",
+			"message": "Vaulty MVP running",
+			"docs":    "/health, /users, /projects, /secrets",
 		})
 	})
-}
 
+	handlers.RegisterRoutes(router)
+}
 
 func initServer() *gin.Engine {
 	router := gin.Default()
