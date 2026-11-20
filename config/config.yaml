@@ -1,0 +1,62 @@
+env: dev
+app:
+  name: vaulty
+  debug: true
+  version: v1.0.0
+http_server:
+  addr: :8080
+  pprof: false
+  default_page_size: 10
+  max_page_size: 100
+  read_timeout: 60s
+  write_timeout: 60s
+# metrics_server:
+#   addr: :9090
+#   enabled: true
+#   path: /metrics
+log:
+  save_path: ./tmp
+  file_name: app
+  max_size: 100
+  max_age: 30
+  local_time: true
+  compress: true
+  level: debug
+  enable_console: true
+  enable_color: true
+  enable_caller: true
+  enable_stacktrace: false
+redis:
+  host: 127.0.0.1
+  port: 6379
+  password: ""
+  db: 0
+  poolSize: 10
+  idleTimeout: 300
+  minIdleConns: 5
+postgres:
+  user: postgres
+  password: postgres
+  host: 127.0.0.1
+  port: 5432
+  database: vaulty_db
+  ssl_mode: disable
+  options: ""
+  max_connections: 100
+  min_connections: 10
+  max_conn_lifetime: 300
+  idle_timeout: 300
+  connect_timeout: 10
+  time_zone: UTC
+# mongodb:
+#   host: 127.0.0.1
+#   port: 27017
+#   database: go_hexagonal
+#   user: ""
+#   password: ""
+#   auth_source: admin
+#   options: ""
+#   min_pool_size: 5
+#   max_pool_size: 100
+#   idle_timeout: 300
+migration_dir: ./migrations
