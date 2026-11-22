@@ -27,6 +27,12 @@ go.work.sum
 # env file
 .env
 
+# local development data (SQLite + local vault key)
+*.db
+*.db-shm
+*.db-wal
+.vaulty-local.key
+
 # Editor/IDE
 # .idea/
 # .vscode/

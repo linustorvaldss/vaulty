@@ -1,172 +1,498 @@
 package httpapi
 
 import (
+	"io"
 	"net/http"
+	"net/url"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 
 	"github.com/linustorvaldss/vaulty/internal/domain"
+	"github.com/linustorvaldss/vaulty/internal/parser"
 	"github.com/linustorvaldss/vaulty/internal/service"
 )
 
-type Handlers struct {
-	service *service.Service
-}
+// ---------- auth ----------
 
-type CreateUserRequest struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
-}
-
-type CreateProjectRequest struct {
-	UserID      string `json:"user_id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-}
-
-type CreateSecretRequest struct {
-	ProjectID string `json:"project_id"`
-	Key       string `json:"key"`
-	Value     string `json:"value"`
-	Type      string `json:"type"`
-}
-
-func NewHandlers(service *service.Service) *Handlers {
-	return &Handlers{service: service}
-}
-
-func (h *Handlers) RegisterRoutes(router *gin.Engine) {
-	router.GET("/health", h.health)
-	router.GET("/users", h.listUsers)
-	router.POST("/users", h.createUser)
-	router.GET("/projects", h.listProjects)
-	router.POST("/projects", h.createProject)
-	router.GET("/secrets", h.listSecrets)
-	router.POST("/secrets", h.createSecret)
-}
-
-func (h *Handlers) health(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status": "ok",
-	})
-}
-
-func (h *Handlers) listUsers(c *gin.Context) {
-	users, err := h.service.ListUsers()
+func (a *API) register(c *gin.Context) {
+	var in service.RegisterInput
+	if !a.bind(c, &in) {
+		return
+	}
+	sess, err := a.svc.Register(c.Request.Context(), in)
 	if err != nil {
-		writeStoreError(c, err)
+		a.fail(c, err)
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"users": users,
-	})
+	c.JSON(http.StatusCreated, sess)
 }
 
-func (h *Handlers) createUser(c *gin.Context) {
-	var request CreateUserRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+func (a *API) login(c *gin.Context) {
+	var in struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if !a.bind(c, &in) {
 		return
 	}
-
-	user, err := h.service.CreateUser(request.Name, request.Email)
+	sess, err := a.svc.Login(c.Request.Context(), in.Email, in.Password)
 	if err != nil {
-		writeStoreError(c, err)
+		a.fail(c, err)
 		return
 	}
-
-	c.JSON(http.StatusCreated, user)
+	c.JSON(http.StatusOK, sess)
 }
 
-func (h *Handlers) listProjects(c *gin.Context) {
-	projects, err := h.service.ListProjects()
-	if err != nil {
-		writeStoreError(c, err)
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"projects": projects,
-	})
+func (a *API) providers(c *gin.Context) {
+	c.JSON(http.StatusOK, items(a.svc.ProviderNames()))
 }
 
-func (h *Handlers) createProject(c *gin.Context) {
-	var request CreateProjectRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
-		return
-	}
+const oauthCookie = "vaulty_oauth_nonce"
 
-	userID, err := uuid.Parse(request.UserID)
+// oauthStart redirects to the provider. ?redirect_uri= is where the browser
+// lands afterwards (must be under an allowed origin, e.g. the web app).
+func (a *API) oauthStart(c *gin.Context) {
+	provider := c.Param("provider")
+	authURL, nonce, err := a.svc.OAuthStart(provider, c.Query("redirect_uri"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+		a.fail(c, err)
 		return
 	}
-
-	project, err := h.service.CreateProject(userID, request.Name, request.Description)
-	if err != nil {
-		writeStoreError(c, err)
-		return
-	}
-
-	c.JSON(http.StatusCreated, project)
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(oauthCookie, nonce, 600, "/api/v1/auth/oauth/"+provider, "", a.opts.SecureCookies, true)
+	c.Redirect(http.StatusFound, authURL)
 }
 
-func (h *Handlers) listSecrets(c *gin.Context) {
-	projectID := uuid.Nil
-	if rawID := c.Query("project_id"); rawID != "" {
-		parsedID, err := uuid.Parse(rawID)
+// oauthCallback redirects to <redirect_uri>#token=...&expires_at=... (the
+// fragment never reaches servers or logs). Without redirect_uri it returns JSON.
+func (a *API) oauthCallback(c *gin.Context) {
+	provider := c.Param("provider")
+	nonce, _ := c.Cookie(oauthCookie)
+	c.SetCookie(oauthCookie, "", -1, "/api/v1/auth/oauth/"+provider, "", a.opts.SecureCookies, true)
+
+	if e := c.Query("error"); e != "" {
+		a.fail(c, domain.Unauthorized("provider error: %s", e))
+		return
+	}
+	sess, redirect, err := a.svc.OAuthCallback(c.Request.Context(), provider, c.Query("code"), c.Query("state"), nonce)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	if redirect == "" {
+		c.JSON(http.StatusOK, sess)
+		return
+	}
+	frag := url.Values{"token": {sess.Token}, "expires_at": {sess.ExpiresAt.Format(time.RFC3339)}}
+	c.Redirect(http.StatusFound, redirect+"#"+frag.Encode())
+}
+
+func (a *API) me(c *gin.Context) {
+	v, err := a.svc.Me(c.Request.Context(), principal(c))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, v)
+}
+
+// ---------- tenants ----------
+
+func (a *API) listTenants(c *gin.Context) {
+	v, err := a.svc.ListTenants(c.Request.Context(), principal(c))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items(v))
+}
+
+func (a *API) createTenant(c *gin.Context) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if !a.bind(c, &in) {
+		return
+	}
+	t, err := a.svc.CreateOrganization(c.Request.Context(), principal(c), in.Name)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, t)
+}
+
+func (a *API) listMembers(c *gin.Context) {
+	v, err := a.svc.ListMembers(c.Request.Context(), scope(c))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items(v))
+}
+
+func (a *API) addMember(c *gin.Context) {
+	var in struct {
+		Email string      `json:"email"`
+		Role  domain.Role `json:"role"`
+	}
+	if !a.bind(c, &in) {
+		return
+	}
+	m, err := a.svc.AddMember(c.Request.Context(), scope(c), in.Email, in.Role)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, m)
+}
+
+func (a *API) removeMember(c *gin.Context) {
+	if err := a.svc.RemoveMember(c.Request.Context(), scope(c), c.Param("userID")); err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// ---------- cloud ----------
+
+func (a *API) getAWS(c *gin.Context) {
+	v, err := a.svc.GetAWSConnection(c.Request.Context(), scope(c))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, v)
+}
+
+func (a *API) setAWS(c *gin.Context) {
+	var in service.AWSConnectionInput
+	if !a.bind(c, &in) {
+		return
+	}
+	v, err := a.svc.SetAWSConnection(c.Request.Context(), scope(c), in)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, v)
+}
+
+func (a *API) verifyAWS(c *gin.Context) {
+	v, err := a.svc.VerifyAWSConnection(c.Request.Context(), scope(c))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, v)
+}
+
+func (a *API) deleteAWS(c *gin.Context) {
+	if err := a.svc.DeleteAWSConnection(c.Request.Context(), scope(c)); err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// ---------- access tokens ----------
+
+func (a *API) createToken(c *gin.Context) {
+	var in service.CreateTokenInput
+	if !a.bind(c, &in) {
+		return
+	}
+	t, err := a.svc.CreateAccessToken(c.Request.Context(), scope(c), in)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, t)
+}
+
+func (a *API) listTokens(c *gin.Context) {
+	v, err := a.svc.ListAccessTokens(c.Request.Context(), principal(c))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items(v))
+}
+
+func (a *API) deleteToken(c *gin.Context) {
+	if err := a.svc.DeleteAccessToken(c.Request.Context(), principal(c), c.Param("id")); err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// ---------- projects & environments ----------
+
+func (a *API) listProjects(c *gin.Context) {
+	v, err := a.svc.ListProjects(c.Request.Context(), scope(c))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items(v))
+}
+
+func (a *API) createProject(c *gin.Context) {
+	var in service.ProjectInput
+	if !a.bind(c, &in) {
+		return
+	}
+	v, err := a.svc.CreateProject(c.Request.Context(), scope(c), in)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, v)
+}
+
+func (a *API) getProject(c *gin.Context) {
+	v, err := a.svc.GetProject(c.Request.Context(), scope(c), c.Param("project"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, v)
+}
+
+func (a *API) updateProject(c *gin.Context) {
+	var in service.ProjectPatch
+	if !a.bind(c, &in) {
+		return
+	}
+	v, err := a.svc.UpdateProject(c.Request.Context(), scope(c), c.Param("project"), in)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, v)
+}
+
+func (a *API) deleteProject(c *gin.Context) {
+	if err := a.svc.DeleteProject(c.Request.Context(), scope(c), c.Param("project")); err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (a *API) listEnvironments(c *gin.Context) {
+	v, err := a.svc.ListEnvironments(c.Request.Context(), scope(c), c.Param("project"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items(v))
+}
+
+func (a *API) createEnvironment(c *gin.Context) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if !a.bind(c, &in) {
+		return
+	}
+	v, err := a.svc.CreateEnvironment(c.Request.Context(), scope(c), c.Param("project"), in.Name)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, v)
+}
+
+func (a *API) deleteEnvironment(c *gin.Context) {
+	if err := a.svc.DeleteEnvironment(c.Request.Context(), scope(c), c.Param("project"), c.Param("env")); err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// ---------- secrets ----------
+
+func (a *API) listSecrets(c *gin.Context) {
+	reveal, _ := strconv.ParseBool(c.Query("reveal"))
+	v, err := a.svc.ListSecrets(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"), reveal)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items(v))
+}
+
+func (a *API) createSecret(c *gin.Context) {
+	var in service.SecretInput
+	if !a.bind(c, &in) {
+		return
+	}
+	v, err := a.svc.CreateSecret(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"), in)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, v)
+}
+
+func (a *API) getSecret(c *gin.Context) {
+	v, err := a.svc.GetSecret(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"), c.Param("key"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, v)
+}
+
+func (a *API) putSecret(c *gin.Context) {
+	var in service.SecretInput
+	if !a.bind(c, &in) {
+		return
+	}
+	in.Key = c.Param("key")
+	v, created, err := a.svc.UpsertSecret(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"), in)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	c.JSON(status, v)
+}
+
+func (a *API) deleteSecret(c *gin.Context) {
+	if err := a.svc.DeleteSecret(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"), c.Param("key")); err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// importSecrets accepts multipart/form-data (field "file") or a raw body.
+// Query: format=auto|dotenv|json|xml|yaml, strategy=overwrite|skip|fail,
+// dry_run=true, separator=__, normalize=true, prefix=APP_.
+func (a *API) importSecrets(c *gin.Context) {
+	var (
+		data     []byte
+		filename = c.Query("filename")
+		err      error
+	)
+	if fh, ferr := c.FormFile("file"); ferr == nil {
+		f, err := fh.Open()
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project_id"})
+			a.fail(c, domain.Invalid("cannot read uploaded file"))
 			return
 		}
-		projectID = parsedID
+		defer f.Close()
+		data, err = io.ReadAll(f)
+		if err != nil {
+			a.fail(c, err)
+			return
+		}
+		filename = fh.Filename
+	} else {
+		if data, err = io.ReadAll(c.Request.Body); err != nil {
+			a.fail(c, err)
+			return
+		}
 	}
-
-	secrets, err := h.service.ListSecrets(projectID)
-	if err != nil {
-		writeStoreError(c, err)
+	if len(data) == 0 {
+		a.fail(c, domain.Invalid("empty file"))
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"secrets": secrets,
+	dry, _ := strconv.ParseBool(c.Query("dry_run"))
+	norm, _ := strconv.ParseBool(c.Query("normalize"))
+	res, err := a.svc.ImportSecrets(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"), service.ImportInput{
+		Data: data, Filename: filename, Format: parser.Format(c.Query("format")),
+		Strategy: service.ImportStrategy(c.Query("strategy")), DryRun: dry,
+		Options: parser.Options{Separator: c.Query("separator"), Normalize: norm, Prefix: c.Query("prefix")},
 	})
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, res)
 }
 
-func (h *Handlers) createSecret(c *gin.Context) {
-	var request CreateSecretRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
-		return
-	}
-
-	projectID, err := uuid.Parse(request.ProjectID)
+// exportSecrets renders an environment: format=dotenv|json|yaml|shell.
+func (a *API) exportSecrets(c *gin.Context) {
+	entries, err := a.svc.ExportSecrets(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project_id"})
+		a.fail(c, err)
 		return
 	}
-
-	secret, err := h.service.CreateSecret(projectID, request.Key, request.Value, request.Type)
-	if err != nil {
-		writeStoreError(c, err)
-		return
-	}
-
-	c.JSON(http.StatusCreated, secret)
+	a.render(c, entries, c.DefaultQuery("format", "dotenv"))
 }
 
-func writeStoreError(c *gin.Context, err error) {
-	switch err {
-	case domain.ErrValidation:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing required fields"})
-	case domain.ErrDuplicate:
-		c.JSON(http.StatusConflict, gin.H{"error": "resource already exists"})
-	case domain.ErrNotFound:
-		c.JSON(http.StatusNotFound, gin.H{"error": "resource not found"})
-	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error"})
+func (a *API) render(c *gin.Context, entries []parser.Entry, format string) {
+	body, ctype, err := parser.Render(entries, parser.Format(format))
+	if err != nil {
+		a.fail(c, domain.Invalid("%v", err))
+		return
 	}
+	c.Data(http.StatusOK, ctype, body)
+}
+
+// ---------- share links ----------
+
+func (a *API) createShare(c *gin.Context) {
+	var in service.ShareInput
+	if !a.bind(c, &in) {
+		return
+	}
+	v, err := a.svc.CreateShareLink(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"), in)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, v)
+}
+
+func (a *API) listShares(c *gin.Context) {
+	v, err := a.svc.ListShareLinks(c.Request.Context(), scope(c), c.Param("project"), c.Param("env"))
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items(v))
+}
+
+func (a *API) revokeShare(c *gin.Context) {
+	if err := a.svc.RevokeShareLink(c.Request.Context(), scope(c), c.Param("id")); err != nil {
+		a.fail(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// openShare is public. Passphrase: X-Share-Passphrase header or JSON body
+// {"passphrase": "..."} (POST). ?format=dotenv|json|yaml|shell returns the
+// raw file; without it the response is JSON with metadata.
+func (a *API) openShare(c *gin.Context) {
+	pass := c.GetHeader("X-Share-Passphrase")
+	if c.Request.Method == http.MethodPost && pass == "" {
+		var in struct {
+			Passphrase string `json:"passphrase"`
+		}
+		_ = c.ShouldBindJSON(&in)
+		pass = in.Passphrase
+	}
+	v, err := a.svc.OpenShareLink(c.Request.Context(), c.Param("token"), pass)
+	if err != nil {
+		a.fail(c, err)
+		return
+	}
+	if f := c.Query("format"); f != "" {
+		a.render(c, v.Secrets, f)
+		return
+	}
+	c.JSON(http.StatusOK, v)
 }
